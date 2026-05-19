@@ -61,6 +61,48 @@ public record DxUser(
         .put("appId", appId);
   }
 
+  public static DxUser fromJsonObject(JsonObject json) {
+    if (json == null) {
+      return null;
+    }
+
+    List<String> roles = json.getJsonArray("roles", new JsonArray()).getList();
+    UUID sub = null;
+    String subStr = json.getString("sub");
+    if (subStr != null && !subStr.isEmpty()) {
+      sub = UUID.fromString(subStr);
+    }
+
+    List<String> pendingRoles =
+        json.getJsonArray("pending_roles", new JsonArray()).getList();
+
+    return new DxUser(
+        roles,
+        json.getString("organisationId"),
+        json.getString("organisationName"),
+        sub,
+        json.getBoolean("emailVerified", false),
+        json.getBoolean("kycVerified", false),
+        json.getString("name"),
+        json.getString("preferredUsername"),
+        json.getString("givenName"),
+        json.getString("familyName"),
+        json.getString("email"),
+        pendingRoles,
+        json.getJsonObject("organisation", new JsonObject()),
+        null,
+        json.getJsonObject("kycInformation", new JsonObject()),
+        json.getString("twitter_account", ""),
+        json.getString("linkedin_account", ""),
+        json.getString("github_account", ""),
+        json.getBoolean("account_enabled"),
+        json.getString("did"),
+        json.getString("aud"),
+        json.getJsonArray("delegation_scope", new JsonArray()),
+        json.getString("delegateeId"),
+        json.getString("appId"));
+  }
+
   public static DxUser withPendingRoles(
       DxUser user, List<String> pendingRoles, JsonObject organisation) {
     return new DxUser(
