@@ -283,12 +283,12 @@ public abstract class AbstractApiServerVerticle extends AbstractVerticle {
 
                 // Auth handlers — auto-wire CombinedAuthHandler when AppId is configured
                 MultiIssuerJwtAuthHandler jwtHandler = new MultiIssuerJwtAuthHandler(jwksResolver);
-                OptionalMultiIssuerJwtAuthHandler optionalAuthHandler =
-                    new OptionalMultiIssuerJwtAuthHandler(jwksResolver);
 
                 AppIdAuthHandler appIdAuthHandler = getAppIdAuthHandler();
                 org.cdpg.dx.auth.authentication.handler.AuthenticationHandler authV2 =
                     getAuthV2Handler();
+                OptionalMultiIssuerJwtAuthHandler optionalAuthHandler =
+                    new OptionalMultiIssuerJwtAuthHandler(authV2);
 
                 AuthenticationHandler mainAuthHandler;
                 if (authV2 != null) {
