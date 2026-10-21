@@ -192,6 +192,37 @@ class AuthorizationHandlerTest {
     }
 
     @Test
+    @DisplayName("DEPT rule wins over SELF and carries the caller's org")
+    void deptTierBeforeSelf() {
+      FakeCtx ctx = new FakeCtx().withUser(
+          principalWithScopes(
+              "alice", "org-a", Scopes.OWN_ASSET_MANAGEMENT, Scopes.DEPT_ASSET_MANAGEMENT));
+      AuthorizationHandler.forScopesWithContext(
+              ScopeRule.org(Scopes.ORG_ASSET_MANAGEMENT),
+              ScopeRule.dept(Scopes.DEPT_ASSET_MANAGEMENT),
+              ScopeRule.self(Scopes.OWN_ASSET_MANAGEMENT))
+          .handle(ctx.mock);
+
+      assertTrue(ctx.nextCalled);
+      AuthorizationContext auth = (AuthorizationContext) ctx.data.get(AuthorizationContext.KEY);
+      assertEquals(AuthLevel.DEPT, auth.getLevel());
+      assertEquals(Scopes.DEPT_ASSET_MANAGEMENT, auth.getScope());
+      assertEquals("org-a", auth.getOrgId());
+    }
+
+    @Test
+    @DisplayName("DEPT rule without organisation context → 403 missing org context")
+    void deptTierRequiresOrg() {
+      FakeCtx ctx = new FakeCtx().withUser(
+          principalWithScopes("alice", null, Scopes.DEPT_USER_MANAGEMENT));
+      AuthorizationHandler.forScopesWithContext(ScopeRule.dept(Scopes.DEPT_USER_MANAGEMENT))
+          .handle(ctx.mock);
+
+      assertFalse(ctx.nextCalled);
+      assertInstanceOf(DxForbiddenException.class, ctx.failedWith);
+    }
+
+    @Test
     @DisplayName("no rule matches → 403")
     void noMatchForbids() {
       FakeCtx ctx = new FakeCtx().withUser(jwtPrincipal("alice", "org-a", DxRole.CONSUMER));

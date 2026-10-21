@@ -117,7 +117,7 @@ public final class AuthorizationHandler {
   }
 
   /**
-   * Walks rules in order — highest authority first (PLATFORM → ORG → SELF). The first matching rule
+   * Walks rules in order — highest authority first (PLATFORM → ORG → DEPT → SELF). The first matching rule
    * wins and publishes an {@link AuthorizationContext} at {@link AuthorizationContext#KEY}.
    */
   public static Handler<RoutingContext> forScopesWithContext(ScopeRule... rules) {
@@ -142,7 +142,8 @@ public final class AuthorizationHandler {
       for (ScopeRule rule : rules) {
         if (!effectiveScopes.contains(rule.scope())) continue;
 
-        if (rule.level() == AuthLevel.ORG && (orgId == null || orgId.isBlank())) {
+        boolean orgBound = rule.level() == AuthLevel.ORG || rule.level() == AuthLevel.DEPT;
+        if (orgBound && (orgId == null || orgId.isBlank())) {
           LOGGER.warn(
               "Skipping org-level scope match: token has scope={} but no organisation_id claim,"
                   + " path={}",
@@ -156,6 +157,7 @@ public final class AuthorizationHandler {
             switch (rule.level()) {
               case PLATFORM -> AuthorizationContext.platform(rule.scope());
               case ORG -> AuthorizationContext.org(rule.scope(), orgId);
+              case DEPT -> AuthorizationContext.dept(rule.scope(), orgId);
               case SELF -> AuthorizationContext.self(rule.scope(), sub);
             };
         ctx.put(AuthorizationContext.KEY, authCtx);
