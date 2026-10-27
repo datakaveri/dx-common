@@ -9,7 +9,7 @@ import java.util.Objects;
  *
  * <p>Rules are evaluated in the order provided — the first rule whose scope is present in the
  * principal's effective scope set wins, and its {@link AuthLevel} is attached to the routing
- * context for the service to read. Put highest authority (PLATFORM) first.
+ * context for the service to read. Put highest authority first: PLATFORM, ORG, DEPT, SELF.
  */
 public final class ScopeRule {
 
@@ -27,6 +27,10 @@ public final class ScopeRule {
 
   public static ScopeRule org(String scope) {
     return new ScopeRule(AuthLevel.ORG, scope);
+  }
+
+  public static ScopeRule dept(String scope) {
+    return new ScopeRule(AuthLevel.DEPT, scope);
   }
 
   public static ScopeRule self(String scope) {

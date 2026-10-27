@@ -15,6 +15,12 @@ public enum AuthLevel {
   /** Organisation-scoped — service filters by the caller's {@code organisationId}. */
   ORG,
 
+  /**
+   * Department-scoped — the caller administers a department subtree of their organisation; the
+   * service filters by {@code organisationId} and that subtree.
+   */
+  DEPT,
+
   /** Self-scoped — service filters by the caller's {@code sub}. */
   SELF
 }

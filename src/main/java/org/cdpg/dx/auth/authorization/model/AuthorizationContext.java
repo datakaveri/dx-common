@@ -36,6 +36,10 @@ public final class AuthorizationContext {
     return new AuthorizationContext(AuthLevel.ORG, scope, orgId, null);
   }
 
+  public static AuthorizationContext dept(String scope, String orgId) {
+    return new AuthorizationContext(AuthLevel.DEPT, scope, orgId, null);
+  }
+
   public static AuthorizationContext self(String scope, String sub) {
     return new AuthorizationContext(AuthLevel.SELF, scope, null, sub);
   }
@@ -48,7 +52,7 @@ public final class AuthorizationContext {
     return scope;
   }
 
-  /** Only set when {@link #getLevel()} is {@link AuthLevel#ORG}. */
+  /** Only set when {@link #getLevel()} is {@link AuthLevel#ORG} or {@link AuthLevel#DEPT}. */
   public String getOrgId() {
     return orgId;
   }

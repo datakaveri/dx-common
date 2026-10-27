@@ -3,7 +3,7 @@ package org.cdpg.dx.auth.model;
 import java.util.Set;
 
 /**
- * The thirteen system scope names. Scopes are the unit of authorization — endpoints require
+ * The system scope names. Scopes are the unit of authorization — endpoints require
  * scopes, and a principal's effective scope set is checked against them.
  *
  * <p>Use these constants at route declaration sites rather than bare strings.
@@ -27,6 +27,24 @@ public final class Scopes {
   public static final String PUBLISHER_MANAGEMENT = "publisher-management";
   public static final String ROLE_MANAGEMENT = "role-management";
 
+  /**
+   * Department-level scopes. Not mapped to any realm role: they are granted at request time to a
+   * caller the service resolves as a department admin, and are bounded to that admin's department
+   * subtree.
+   */
+  public static final String DEPT_USER_MANAGEMENT = "dept-user-management";
+  public static final String DEPT_ASSET_MANAGEMENT = "dept-asset-management";
+  public static final String DEPT_ASSET_PUBLISH = "dept-asset-publish";
+  public static final String DEPT_PUBLISHER_MANAGEMENT = "dept-publisher-management";
+
+  /** The full department-admin scope bundle. */
+  public static final Set<String> DEPT_ADMIN =
+      Set.of(
+          DEPT_USER_MANAGEMENT,
+          DEPT_ASSET_MANAGEMENT,
+          DEPT_ASSET_PUBLISH,
+          DEPT_PUBLISHER_MANAGEMENT);
+
   public static final String COMPUTE_MANAGEMENT = "compute-management";
   public static final String CREDIT_MANAGEMENT = "credit-management";
 
@@ -38,6 +56,10 @@ public final class Scopes {
           ORG_ASSET_MANAGEMENT,
           ORG_ASSET_PUBLISH,
           ORG_PUBLISHER_MANAGEMENT,
+          DEPT_USER_MANAGEMENT,
+          DEPT_ASSET_MANAGEMENT,
+          DEPT_ASSET_PUBLISH,
+          DEPT_PUBLISHER_MANAGEMENT,
           ORG_MANAGEMENT,
           ASSET_PUBLISH,
           ASSET_MANAGEMENT,
