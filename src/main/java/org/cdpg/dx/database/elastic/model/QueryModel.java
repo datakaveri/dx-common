@@ -746,10 +746,9 @@ public class QueryModel {
   public List<SortOptions> toSortOptions() {
     List<SortOptions> sortOptions = new ArrayList<>();
 
-    // Add _score sorting FIRST
-
-    sortOptions.add(SortOptions.of(s -> s.score(sc -> sc.order(SortOrder.Desc))));
-
+    // Caller-requested sort fields take precedence (e.g. itemCreatedAt:desc for "New to Old").
+    // _score is appended last so it only breaks ties; when no sort is requested it is the sole
+    // criterion, preserving relevance ranking for plain text searches.
     if (sortFields != null && !sortFields.isEmpty()) {
       sortOptions.addAll(
           sortFields.entrySet().stream()
@@ -766,7 +765,10 @@ public class QueryModel {
                                                   : SortOrder.Desc))))
               .toList());
     }
-    return sortOptions.isEmpty() ? null : sortOptions;
+
+    sortOptions.add(SortOptions.of(s -> s.score(sc -> sc.order(SortOrder.Desc))));
+
+    return sortOptions;
   }
 
   /**
