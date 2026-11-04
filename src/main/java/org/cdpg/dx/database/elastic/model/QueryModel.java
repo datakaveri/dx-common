@@ -93,6 +93,10 @@ public class QueryModel {
   private List<String> excludeFields;
   private Map<String, String> sortFields; // Key: Field name, Value: Sort order ("asc" or "desc")
 
+  // When true (free-text query present), _score is the primary sort and sortFields break ties.
+  // When false, sortFields take precedence and _score is the final tie-breaker.
+  private boolean relevanceFirst;
+
   // Field for storing the script source (the actual script)
   private String scriptSource;
 
@@ -399,6 +403,14 @@ public class QueryModel {
 
   public void setSortFields(Map<String, String> sortFields) {
     this.sortFields = sortFields;
+  }
+
+  public boolean isRelevanceFirst() {
+    return relevanceFirst;
+  }
+
+  public void setRelevanceFirst(boolean relevanceFirst) {
+    this.relevanceFirst = relevanceFirst;
   }
 
   public String getScriptSource() {
@@ -745,10 +757,14 @@ public class QueryModel {
    */
   public List<SortOptions> toSortOptions() {
     List<SortOptions> sortOptions = new ArrayList<>();
+    SortOptions scoreSort = SortOptions.of(s -> s.score(sc -> sc.order(SortOrder.Desc)));
 
-    // Caller-requested sort fields take precedence (e.g. itemCreatedAt:desc for "New to Old").
-    // _score is appended last so it only breaks ties; when no sort is requested it is the sole
-    // criterion, preserving relevance ranking for plain text searches.
+    // Text search (q): relevance is the primary order, requested fields only break ties.
+    // Otherwise: requested fields (e.g. itemCreatedAt:desc) win and _score breaks ties.
+    if (relevanceFirst) {
+      sortOptions.add(scoreSort);
+    }
+
     if (sortFields != null && !sortFields.isEmpty()) {
       sortOptions.addAll(
           sortFields.entrySet().stream()
@@ -766,7 +782,9 @@ public class QueryModel {
               .toList());
     }
 
-    sortOptions.add(SortOptions.of(s -> s.score(sc -> sc.order(SortOrder.Desc))));
+    if (!relevanceFirst) {
+      sortOptions.add(scoreSort);
+    }
 
     return sortOptions;
   }
