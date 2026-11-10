@@ -13,7 +13,18 @@ public record UserInfo(
     String preferredUsername,
     String givenName,
     String familyName,
-    String email) {
+    String email,
+    String status) {
+
+  public UserInfo(
+      UUID sub,
+      String name,
+      String preferredUsername,
+      String givenName,
+      String familyName,
+      String email) {
+    this(sub, name, preferredUsername, givenName, familyName, email, null);
+  }
 
   public JsonObject toJson() {
     return new JsonObject()
@@ -22,6 +33,7 @@ public record UserInfo(
         .put("preferredUsername", preferredUsername)
         .put("givenName", givenName)
         .put("familyName", familyName)
-        .put("email", email);
+        .put("email", email)
+        .put("status", status);
   }
 }

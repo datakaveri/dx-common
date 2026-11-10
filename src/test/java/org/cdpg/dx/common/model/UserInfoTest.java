@@ -58,4 +58,21 @@ class UserInfoTest {
     assertThat(a).isEqualTo(b);
     assertThat(a.hashCode()).isEqualTo(b.hashCode());
   }
+
+  @Test
+  @DisplayName("toJson serializes status")
+  void toJsonSerializesStatus() {
+    UserInfo info =
+        new UserInfo(UUID.randomUUID(), "John Doe", "jdoe", "John", "Doe", "john@example.com", "ACTIVE");
+
+    assertThat(info.toJson().getString("status")).isEqualTo("ACTIVE");
+  }
+
+  @Test
+  @DisplayName("six-arg constructor leaves status null")
+  void sixArgConstructorNullStatus() {
+    UserInfo info = new UserInfo(UUID.randomUUID(), "Name", "user", "First", "Last", "user@test.com");
+
+    assertThat(info.status()).isNull();
+  }
 }

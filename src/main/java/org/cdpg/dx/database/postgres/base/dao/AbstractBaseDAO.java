@@ -116,7 +116,14 @@ public abstract class AbstractBaseDAO<T extends BaseEntity<T>> implements BaseDA
   public Future<List<T>> getAllWithFilters(Map<String, Object> filters) {
     Condition condition =
         filters.entrySet().stream()
-            .map(e -> new Condition(e.getKey(), Condition.Operator.EQUALS, List.of(e.getValue())))
+            .map(
+                e -> {
+                  if (e.getValue() instanceof List<?> values) {
+                    return new Condition(e.getKey(), Condition.Operator.IN, (List<Object>) values);
+                  }
+                  return new Condition(
+                      e.getKey(), Condition.Operator.EQUALS, List.of(e.getValue()));
+                })
             .reduce((c1, c2) -> new Condition(List.of(c1, c2), Condition.LogicalOperator.AND))
             .orElse(null);
 
@@ -208,7 +215,7 @@ public abstract class AbstractBaseDAO<T extends BaseEntity<T>> implements BaseDA
     int size = request.size() > 0 ? request.size() : 10;
     int offset = (page - 1) * size;
 
-    Condition condition = fromFilters(request.filters(), request.temporalRequests());
+    Condition condition = fromFilters(request.filters(), request.temporalRequests(), request.fuzzyFilters());
     List<OrderBy> orderBy = request.orderByList();
 
     LOGGER.debug("Preparing to execute paginated query for table: {}", tableName);
@@ -267,7 +274,7 @@ public abstract class AbstractBaseDAO<T extends BaseEntity<T>> implements BaseDA
             });
   }
 
-  private PaginatedResult<T> toPaginatedResult(QueryResult result, int page, int size) {
+  public PaginatedResult<T> toPaginatedResult(QueryResult result, int page, int size) {
     List<T> entities =
         result.getRows().stream()
             .map(row -> fromJson.apply((JsonObject) row))

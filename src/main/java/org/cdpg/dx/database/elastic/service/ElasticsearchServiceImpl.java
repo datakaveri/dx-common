@@ -1,6 +1,22 @@
 package org.cdpg.dx.database.elastic.service;
 
-import static org.cdpg.dx.database.elastic.util.Constants.*;
+import static org.cdpg.dx.database.elastic.util.Constants.AGGREGATIONS;
+import static org.cdpg.dx.database.elastic.util.Constants.AGGREGATION_LIST;
+import static org.cdpg.dx.database.elastic.util.Constants.AGGREGATION_ONLY;
+import static org.cdpg.dx.database.elastic.util.Constants.BUCKETS;
+import static org.cdpg.dx.database.elastic.util.Constants.COUNT_AGGREGATION_ONLY;
+import static org.cdpg.dx.database.elastic.util.Constants.DOC_COUNT;
+import static org.cdpg.dx.database.elastic.util.Constants.DOC_IDS_ONLY;
+import static org.cdpg.dx.database.elastic.util.Constants.ID;
+import static org.cdpg.dx.database.elastic.util.Constants.KEY;
+import static org.cdpg.dx.database.elastic.util.Constants.RESULTS;
+import static org.cdpg.dx.database.elastic.util.Constants.SOURCE;
+import static org.cdpg.dx.database.elastic.util.Constants.SOURCE_AND_ID;
+import static org.cdpg.dx.database.elastic.util.Constants.SOURCE_AND_ID_GEOQUERY;
+import static org.cdpg.dx.database.elastic.util.Constants.SOURCE_ONLY;
+import static org.cdpg.dx.database.elastic.util.Constants.STRING_SIZE;
+import static org.cdpg.dx.database.elastic.util.Constants.SUMMARY_KEY;
+import static org.cdpg.dx.database.elastic.util.Constants.WORD_VECTOR_KEY;
 
 import co.elastic.clients.elasticsearch.ElasticsearchAsyncClient;
 import co.elastic.clients.elasticsearch._types.Refresh;
@@ -9,25 +25,42 @@ import co.elastic.clients.elasticsearch._types.Script;
 import co.elastic.clients.elasticsearch._types.SortOptions;
 import co.elastic.clients.elasticsearch._types.aggregations.Aggregation;
 import co.elastic.clients.elasticsearch._types.query_dsl.Query;
-import co.elastic.clients.elasticsearch.core.*;
+import co.elastic.clients.elasticsearch.core.BulkRequest;
+import co.elastic.clients.elasticsearch.core.CountRequest;
+import co.elastic.clients.elasticsearch.core.DeleteByQueryRequest;
+import co.elastic.clients.elasticsearch.core.DeleteRequest;
+import co.elastic.clients.elasticsearch.core.ExistsRequest;
+import co.elastic.clients.elasticsearch.core.GetRequest;
+import co.elastic.clients.elasticsearch.core.IndexRequest;
+import co.elastic.clients.elasticsearch.core.SearchRequest;
+import co.elastic.clients.elasticsearch.core.SearchResponse;
+import co.elastic.clients.elasticsearch.core.UpdateByQueryRequest;
+import co.elastic.clients.elasticsearch.core.UpdateRequest;
 import co.elastic.clients.elasticsearch.core.bulk.BulkResponseItem;
 import co.elastic.clients.elasticsearch.core.search.Hit;
 import co.elastic.clients.elasticsearch.indices.CreateIndexRequest;
 import co.elastic.clients.json.JsonData;
 import co.elastic.clients.json.JsonpMapper;
 import co.elastic.clients.json.JsonpMapperFeatures;
+import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.vertx.core.Future;
 import io.vertx.core.Promise;
 import io.vertx.core.Vertx;
+import io.vertx.core.json.EncodeException;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
+import io.vertx.core.json.jackson.DatabindCodec;
 import jakarta.json.stream.JsonGenerator;
 import java.io.StringReader;
 import java.io.StringWriter;
 import java.nio.charset.StandardCharsets;
-import java.util.*;
-import java.util.concurrent.atomic.AtomicReference;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.stream.Collectors;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -51,10 +84,42 @@ public class ElasticsearchServiceImpl implements ElasticsearchService {
 
   static ElasticClient client;
   private static ElasticsearchAsyncClient asyncClient;
+  private static volatile ObjectMapper nullPreservingMapper;
 
   public ElasticsearchServiceImpl(ElasticClient client) {
     ElasticsearchServiceImpl.client = client;
     asyncClient = client.getClient();
+  }
+
+  /**
+   * {@link JsonObject#encode()} serializes via Vert.x's shared, process-wide {@link
+   * DatabindCodec#mapper()}, which the API server configures with {@code NON_EMPTY} inclusion for
+   * response bodies. Using that mapper here would silently drop explicit null values (e.g. {@code
+   * "inactive_date": null}) before the document ever reaches Elasticsearch. This clones the shared
+   * mapper (preserving date formatting/naming config) and overrides inclusion back to {@code
+   * ALWAYS} so ES write payloads keep null values the caller explicitly sent.
+   */
+  private static ObjectMapper nullPreservingMapper() {
+    ObjectMapper mapper = nullPreservingMapper;
+    if (mapper == null) {
+      synchronized (ElasticsearchServiceImpl.class) {
+        mapper = nullPreservingMapper;
+        if (mapper == null) {
+          mapper = DatabindCodec.mapper().copy();
+          mapper.setSerializationInclusion(JsonInclude.Include.ALWAYS);
+          nullPreservingMapper = mapper;
+        }
+      }
+    }
+    return mapper;
+  }
+
+  private static String encodePreservingNulls(JsonObject json) {
+    try {
+      return nullPreservingMapper().writeValueAsString(json.getMap());
+    } catch (Exception e) {
+      throw new EncodeException("Failed to encode JSON object", e);
+    }
   }
 
   @Override
@@ -289,10 +354,45 @@ public class ElasticsearchServiceImpl implements ElasticsearchService {
   }
 
   @Override
+  public Future<ElasticsearchResponse> getDocumentById(String index, String id) {
+    return validateIndex(index)
+        .compose(v -> validateId(id))
+        .compose(v -> executeGetById(index, id));
+  }
+
+  private Future<ElasticsearchResponse> executeGetById(String index, String id) {
+    Promise<ElasticsearchResponse> promise = Promise.promise();
+    GetRequest req = GetRequest.of(g -> g.index(index).id(id));
+    asyncClient
+        .get(req, ObjectNode.class)
+        .whenComplete(
+            (resp, err) -> {
+              if (err != null) {
+                promise.fail(new RuntimeException("Get by ID error", err));
+              } else if (!resp.found()) {
+                promise.complete(new ElasticsearchResponse());
+              } else {
+                JsonObject source =
+                    resp.source() != null ? new JsonObject(resp.source().toString()) : new JsonObject();
+                source.remove(SUMMARY_KEY);
+                promise.complete(new ElasticsearchResponse(resp.id(), source));
+              }
+            });
+    return promise.future();
+  }
+
+  @Override
   public Future<List<String>> createDocuments(String index, List<QueryModel> documentModels) {
     return validateIndex(index)
         .compose(v -> validateDocumentModels(documentModels))
         .compose(v -> executeBulkIndex(index, documentModels));
+  }
+
+  @Override
+  public Future<List<String>> createDocumentsAutoId(String index, List<QueryModel> documentModels) {
+    return validateIndex(index)
+        .compose(v -> validateDocumentModels(documentModels))
+        .compose(v -> executeBulkIndexAutoId(index, documentModels));
   }
 
   @Override
@@ -310,6 +410,16 @@ public class ElasticsearchServiceImpl implements ElasticsearchService {
         .compose(v -> validateQueryModel(queryModel))
         .compose(v -> executeExistenceCheck(index, id))
         .compose(v -> executeUpdate(index, id, queryModel));
+  }
+
+  @Override
+  public Future<Void> patchDocument(String index, String id, QueryModel queryModel) {
+    LOGGER.debug("Update document with index: {}, id: {}, queryModel: {}", index, id, queryModel);
+    return validateIndex(index)
+        .compose(v -> validateId(id))
+        .compose(v -> validateQueryModel(queryModel))
+        .compose(v -> executeExistenceCheck(index, id))
+        .compose(v -> executePatch(index, id, queryModel));
   }
 
   @Override
@@ -389,47 +499,33 @@ public class ElasticsearchServiceImpl implements ElasticsearchService {
   }
 
   @Override
-  public Future<BulkSyncResult> bulkUpdateById(
-      String index,
-      List<BulkScriptUpdate> updates
-  ) {
-    return validateIndex(index)
-        .compose(v -> executeBulkUpdateById(index, updates));
+  public Future<BulkSyncResult> bulkUpdateById(String index, List<BulkScriptUpdate> updates) {
+    return validateIndex(index).compose(v -> executeBulkUpdateById(index, updates));
   }
 
   private Future<BulkSyncResult> executeBulkUpdateById(
-      String index,
-      List<BulkScriptUpdate> updates
-  ) {
+      String index, List<BulkScriptUpdate> updates) {
     Promise<BulkSyncResult> promise = Promise.promise();
 
     BulkRequest.Builder bulkBuilder = new BulkRequest.Builder();
 
     for (BulkScriptUpdate upd : updates) {
-      Script script = Script.of(s -> s
-          .lang("painless")
-          .source(upd.getScriptSource())
-          .params(
-              upd.getScriptParams().getMap().entrySet().stream()
-                  .collect(Collectors.toMap(
-                      Map.Entry::getKey,
-                      e -> JsonData.of(e.getValue())
-                  ))
-          )
-      );
+      Script script =
+          Script.of(
+              s ->
+                  s.lang("painless")
+                      .source(upd.getScriptSource())
+                      .params(
+                          upd.getScriptParams().getMap().entrySet().stream()
+                              .collect(
+                                  Collectors.toMap(
+                                      Map.Entry::getKey, e -> JsonData.of(e.getValue())))));
 
-      bulkBuilder.operations(op ->
-          op.update(u ->
-              u.index(index)
-                  .id(upd.getId())
-                  .action(a -> a.script(script))
-          )
-      );
+      bulkBuilder.operations(
+          op -> op.update(u -> u.index(index).id(upd.getId()).action(a -> a.script(script))));
     }
 
-    BulkRequest request = bulkBuilder
-        .refresh(Refresh.WaitFor)
-        .build();
+    BulkRequest request = bulkBuilder.refresh(Refresh.WaitFor).build();
 
     LOGGER.debug("Bulk update request: {}", request);
 
@@ -451,16 +547,13 @@ public class ElasticsearchServiceImpl implements ElasticsearchService {
 
                   // Missing docs are expected -- log & continue
                   LOGGER.warn(
-                      "Bulk update failed for id {} : {}",
-                      item.id(),
-                      item.error().reason()
-                  );
+                      "Bulk update failed for id {} : {}", item.id(), item.error().reason());
 
-                  failures.add(new JsonObject()
-                      .put("id", item.id())
-                      .put("reason", item.error().type())
-                      .put("message", item.error().reason())
-                  );
+                  failures.add(
+                      new JsonObject()
+                          .put("id", item.id())
+                          .put("reason", item.error().type())
+                          .put("message", item.error().reason()));
 
                 } else {
                   success++;
@@ -474,13 +567,7 @@ public class ElasticsearchServiceImpl implements ElasticsearchService {
               }
 
               promise.complete(
-                  new BulkSyncResult(
-                      updates.size(),
-                      success,
-                      failures.size(),
-                      failures
-                  )
-              );
+                  new BulkSyncResult(updates.size(), success, failures.size(), failures));
             });
 
     return promise.future();
@@ -569,10 +656,10 @@ public class ElasticsearchServiceImpl implements ElasticsearchService {
               } else {
                 Hit<ObjectNode> hit = resp.hits().hits().getFirst();
                 LOGGER.debug("Single document found with ID: {}", hit.id());
-                JsonObject source = JsonObject.mapFrom(hit.source());
+                JsonObject source =
+                    hit.source() != null ? new JsonObject(hit.source().toString()) : new JsonObject();
                 source.remove(SUMMARY_KEY);
-                ElasticsearchResponse response =
-                    new ElasticsearchResponse(hit.id(), new JsonObject(source.toString()));
+                ElasticsearchResponse response = new ElasticsearchResponse(hit.id(), source);
                 promise.complete(response);
               }
             });
@@ -586,7 +673,7 @@ public class ElasticsearchServiceImpl implements ElasticsearchService {
     models.forEach(
         queryModel -> {
           JsonObject doc = queryModel.extractDocumentFromQueryModel();
-          String rawJson = doc.encode();
+          String rawJson = encodePreservingNulls(doc);
           JsonData jsonData = JsonData.fromJson(rawJson);
 
           bulkBuilder.operations(
@@ -603,12 +690,46 @@ public class ElasticsearchServiceImpl implements ElasticsearchService {
                 LOGGER.error("bulk index failed");
                 promise.fail(new RuntimeException("Bulk index error"));
               } else {
-                LOGGER.debug("bulk Response {}", bulkResponse);
+                // LOGGER.debug("bulk Response {}", bulkResponse);
                 List<String> ids =
                     bulkResponse.items().stream()
                         .map(BulkResponseItem::id)
                         .collect(Collectors.toList());
-                LOGGER.debug("ids: {}", ids);
+                // LOGGER.debug("ids: {}", ids);
+                promise.complete(ids);
+              }
+            });
+    return promise.future();
+  }
+
+  private Future<List<String>> executeBulkIndexAutoId(String index, List<QueryModel> models) {
+    Promise<List<String>> promise = Promise.promise();
+    LOGGER.debug("Index " + index);
+    BulkRequest.Builder bulkBuilder = new BulkRequest.Builder();
+    models.forEach(
+        queryModel -> {
+          JsonObject doc = queryModel.extractDocumentFromQueryModel();
+          String rawJson = encodePreservingNulls(doc);
+          JsonData jsonData = JsonData.fromJson(rawJson);
+
+          bulkBuilder.operations(
+              operation -> operation.index(docs -> docs.index(index).document(jsonData)));
+        });
+    BulkRequest request = bulkBuilder.build();
+    asyncClient
+        .bulk(request)
+        .whenComplete(
+            (bulkResponse, error) -> {
+              if (bulkResponse.errors()) {
+                LOGGER.error("bulk index failed");
+                promise.fail(new RuntimeException("Bulk index error"));
+              } else {
+                // LOGGER.debug("bulk Response " + bulkResponse);
+                List<String> ids =
+                    bulkResponse.items().stream()
+                        .map(BulkResponseItem::id)
+                        .collect(Collectors.toList());
+                // LOGGER.debug("ids: " + ids);
                 promise.complete(ids);
               }
             });
@@ -657,19 +778,52 @@ public class ElasticsearchServiceImpl implements ElasticsearchService {
 
   private Future<Void> executeUpdate(String index, String id, QueryModel model) {
     Promise<Void> promise = Promise.promise();
-    JsonObject doc = model.extractDocumentFromQueryModel();
-    String rawJson = doc.encode();
-    JsonData jsonData = JsonData.fromJson(rawJson);
 
-    UpdateRequest<String, JsonData> updateRequest =
-        UpdateRequest.of(u -> u.index(index).id(id).doc(jsonData));
+    JsonObject doc = model.extractDocumentFromQueryModel();
+
+    IndexRequest<JsonData> request =
+        new IndexRequest.Builder<JsonData>()
+            .index(index)
+            .id(id)
+            .document(JsonData.fromJson(encodePreservingNulls(doc)))
+            .build();
 
     asyncClient
-        .update(updateRequest, JsonObject.class)
+        .index(request)
         .whenComplete(
             (res, err) -> {
               if (err != null) {
-                LOGGER.error("update failed {}", err.getMessage());
+                LOGGER.error("update failed {}", err.getMessage(), err);
+                promise.fail(new RuntimeException("Update error", err));
+              } else {
+                promise.complete();
+              }
+            });
+    return promise.future();
+  }
+
+  private Future<Void> executePatch(String index, String id, QueryModel model) {
+    Promise<Void> promise = Promise.promise();
+    Script script = model.toElasticsearchScript();
+
+    UpdateRequest.Builder<String, JsonData> builder =
+        new UpdateRequest.Builder<String, JsonData>().index(index).id(id).retryOnConflict(3);
+
+    if (script != null) {
+      builder.script(script);
+    } else {
+      JsonObject doc = model.extractDocumentFromQueryModel();
+      builder.doc(JsonData.fromJson(encodePreservingNulls(doc)));
+    }
+
+    UpdateRequest<String, JsonData> request = builder.build();
+
+    asyncClient
+        .update(request, JsonObject.class)
+        .whenComplete(
+            (res, err) -> {
+              if (err != null) {
+                LOGGER.error("patch failed {}", err.getMessage(), err);
                 promise.fail(new RuntimeException("Update error", err));
               } else {
                 promise.complete();
@@ -925,5 +1079,4 @@ public class ElasticsearchServiceImpl implements ElasticsearchService {
     }
     return results;
   }
-
 }

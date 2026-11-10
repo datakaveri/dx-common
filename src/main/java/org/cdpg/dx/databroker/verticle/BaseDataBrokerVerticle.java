@@ -21,10 +21,11 @@ import org.cdpg.dx.databroker.util.Vhosts;
 /**
  * Base verticle for setting up RabbitMQ infrastructure (clients, service proxy).
  *
- * <p>Subclasses should override {@link #onBrokerReady(RabbitMQClient, RabbitMQClient, RabbitClient)}
- * to set up project-specific message consumers (audit, email, leaderboard, etc.).
+ * <p>Subclasses should override {@link #onBrokerReady(RabbitMQClient, RabbitMQClient,
+ * RabbitClient)} to set up project-specific message consumers (audit, email, leaderboard, etc.).
  *
  * <h3>Usage:</h3>
+ *
  * <pre>{@code
  * public class MyDataBrokerVerticle extends BaseDataBrokerVerticle {
  *   @Override
@@ -60,6 +61,7 @@ public abstract class BaseDataBrokerVerticle extends AbstractVerticle {
     int networkRecoveryInterval = config().getInteger("networkRecoveryInterval");
     String amqpUrl = config().getString("brokerAmqpIp");
     int amqpPort = config().getInteger("brokerAmqpPort");
+    boolean isSSL = config().getBoolean("portSsl", false);
 
     // Configure RabbitMQ options
     RabbitMQOptions rabbitMQOptions = new RabbitMQOptions();
@@ -90,6 +92,7 @@ public abstract class BaseDataBrokerVerticle extends AbstractVerticle {
     webConfig.setDefaultHost(dataBrokerIp);
     webConfig.setDefaultPort(dataBrokerManagementPort);
     webConfig.setKeepAliveTimeout(86400000);
+    webConfig.setSsl(isSSL);
 
     // Create clients
     RabbitMQClient.create(vertx, rabbitMQOptions);
@@ -121,8 +124,8 @@ public abstract class BaseDataBrokerVerticle extends AbstractVerticle {
   }
 
   /**
-   * Called after RabbitMQ clients are initialized. Subclasses should override
-   * this to set up message consumers, listeners, etc.
+   * Called after RabbitMQ clients are initialized. Subclasses should override this to set up
+   * message consumers, listeners, etc.
    *
    * @param internalClient the RabbitMQ client for the internal vhost
    * @param prodClient the RabbitMQ client for the production vhost

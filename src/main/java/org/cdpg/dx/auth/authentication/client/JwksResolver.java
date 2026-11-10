@@ -13,9 +13,15 @@ import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.cdpg.dx.auth.common.AuthConstants;
+import org.cdpg.dx.keycloak.config.KeycloakConstants;
 
 public class JwksResolver {
+
   private static final Logger LOGGER = LogManager.getLogger(JwksResolver.class);
+
+  private static final int  DEFAULT_LEEWAY     = 60;
+  private static final long DEFAULT_REFRESH_MS = 600_000L;
 
   private final Map<String, JWTAuth> cache = new ConcurrentHashMap<>();
   private final JsonObject issuerConfig;
@@ -24,72 +30,64 @@ public class JwksResolver {
   private final int leeway;
   private final Vertx vertx;
 
-  /**
-   * Create a JwksResolver.
-   *
-   * @param vertx the Vert.x instance
-   * @param issuerConfig JSON config with issuer entries and optional jwtIgnoreExpiry, jwtLeeway,
-   *     jwksRefreshIntervalMs
-   * @param internalJwksProvider supplier for internal JWKS (null if no internal issuer support,
-   *     e.g. for dataplane servers)
-   */
   public JwksResolver(
       Vertx vertx, JsonObject issuerConfig, Supplier<Future<JsonObject>> internalJwksProvider) {
     this.issuerConfig = issuerConfig;
     this.vertx = vertx;
-    this.ignoreExpiry = issuerConfig.getBoolean("jwtIgnoreExpiry", false);
-    this.leeway = issuerConfig.getInteger("jwtLeeway", 60);
+    this.ignoreExpiry = issuerConfig.getBoolean(AuthConstants.JWT_IGNORE_EXPIRY, false);
+    this.leeway = issuerConfig.getInteger(AuthConstants.JWT_LEEWAY, DEFAULT_LEEWAY);
     this.jwksClient = new JwksClient(vertx, internalJwksProvider);
 
-    long resetIntervalMs = issuerConfig.getLong("jwksRefreshIntervalMs", 600_000L);
-
-    vertx.setPeriodic(
-        resetIntervalMs,
-        id -> {
-          LOGGER.info("Resetting JWKS cache after {} ms", resetIntervalMs);
-          cache.clear();
-        });
+    long resetIntervalMs = issuerConfig.getLong(AuthConstants.JWKS_REFRESH_INTERVAL, DEFAULT_REFRESH_MS);
+    vertx.setPeriodic(resetIntervalMs, id -> {
+      LOGGER.info("Resetting JWKS cache after {} ms", resetIntervalMs);
+      cache.clear();
+    });
   }
 
-  public Future<JWTAuth> resolve(String issuer) {
-    LOGGER.debug("Resolving JWTAuth for issuer: {}", issuer);
+  public Future<JWTAuth> resolve(String issuer, String kid) {
+    String cacheKey = issuer + "#" + kid;
+    LOGGER.debug("Resolving JWTAuth for issuer: {}, kid: {}", issuer, kid);
 
-    if (cache.containsKey(issuer)) {
-      LOGGER.info("cache hit for issuer {}", issuer);
-      return Future.succeededFuture(cache.get(issuer));
+    if (cache.containsKey(cacheKey)) {
+      LOGGER.info("cache hit for issuer {}, kid {}", issuer, kid);
+      return Future.succeededFuture(cache.get(cacheKey));
     }
-    LOGGER.info("cache miss - need to create JWTAuth provider for issuer {}", issuer);
+    LOGGER.info("cache miss - need to create JWTAuth provider for issuer {}, kid {}", issuer, kid);
 
     JsonObject cfg = issuerConfig.getJsonObject(issuer);
     if (cfg == null) {
       return Future.failedFuture("Unknown issuer: " + issuer);
     }
-    String type = cfg.getString("type", "remote");
-    String jwksUrl = cfg.getString("jwksUrl");
+    String type    = cfg.getString(AuthConstants.JWKS_TYPE, JwksClient.TYPE_REMOTE);
+    String jwksUrl = cfg.getString(AuthConstants.JWKS_URL);
 
     return jwksClient
         .fetchJwks(type, jwksUrl)
-        .map(
-            jwks -> {
-              List<JsonObject> keys =
-                  jwks.getJsonArray("keys").stream()
-                      .map(obj -> (JsonObject) obj)
-                      .collect(Collectors.toList());
+        .compose(jwks -> {
+          List<JsonObject> keys =
+              jwks.getJsonArray(KeycloakConstants.JWKS_KEYS).stream()
+                  .map(obj -> (JsonObject) obj)
+                  .filter(k -> kid.equals(k.getString(KeycloakConstants.CLAIM_KID)))
+                  .collect(Collectors.toList());
 
-              JWTAuthOptions options =
-                  new JWTAuthOptions()
-                      .setJwks(keys)
-                      .setJWTOptions(
-                          new JWTOptions()
-                              .setLeeway(leeway)
-                              .setIgnoreExpiration(ignoreExpiry)
-                              .setIssuer(issuer));
+          if (keys.isEmpty()) {
+            return Future.failedFuture("No JWK found for issuer: " + issuer + ", kid: " + kid);
+          }
 
-              JWTAuth jwtAuth = JWTAuth.create(vertx, options);
-              cache.put(issuer, jwtAuth);
+          JWTAuthOptions options =
+              new JWTAuthOptions()
+                  .setJwks(keys)
+                  .setJWTOptions(
+                      new JWTOptions()
+                          .setLeeway(leeway)
+                          .setIgnoreExpiration(ignoreExpiry)
+                          .setIssuer(issuer));
 
-              LOGGER.info("Created new JWTAuth provider for issuer {}", issuer);
-              return jwtAuth;
-            });
+          JWTAuth jwtAuth = JWTAuth.create(vertx, options);
+          cache.put(cacheKey, jwtAuth);
+          LOGGER.info("Created new JWTAuth provider for issuer {}, kid {}", issuer, kid);
+          return Future.succeededFuture(jwtAuth);
+        });
   }
 }

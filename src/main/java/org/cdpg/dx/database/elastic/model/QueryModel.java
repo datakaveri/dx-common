@@ -1,16 +1,58 @@
 package org.cdpg.dx.database.elastic.model;
 
-import static org.cdpg.dx.database.elastic.util.Constants.*;
+import static org.cdpg.dx.database.elastic.util.Constants.CASE_INSENSITIVE;
+import static org.cdpg.dx.database.elastic.util.Constants.COORDINATES;
+import static org.cdpg.dx.database.elastic.util.Constants.FIELD;
+import static org.cdpg.dx.database.elastic.util.Constants.FUZZY;
+import static org.cdpg.dx.database.elastic.util.Constants.GEO_CIRCLE;
+import static org.cdpg.dx.database.elastic.util.Constants.GEO_PROPERTY;
+import static org.cdpg.dx.database.elastic.util.Constants.GREATER_THAN;
+import static org.cdpg.dx.database.elastic.util.Constants.GREATER_THAN_EQUALS;
+import static org.cdpg.dx.database.elastic.util.Constants.LESS_THAN;
+import static org.cdpg.dx.database.elastic.util.Constants.LESS_THAN_EQUALS;
+import static org.cdpg.dx.database.elastic.util.Constants.OPERATOR;
+import static org.cdpg.dx.database.elastic.util.Constants.Q_VALUE;
+import static org.cdpg.dx.database.elastic.util.Constants.TYPE;
+import static org.cdpg.dx.database.elastic.util.Constants.VALUE;
 
-import co.elastic.clients.elasticsearch._types.*;
+import co.elastic.clients.elasticsearch._types.FieldValue;
+import co.elastic.clients.elasticsearch._types.GeoLocation;
+import co.elastic.clients.elasticsearch._types.GeoShapeRelation;
+import co.elastic.clients.elasticsearch._types.LatLonGeoLocation;
+import co.elastic.clients.elasticsearch._types.Script;
+import co.elastic.clients.elasticsearch._types.SortOptions;
+import co.elastic.clients.elasticsearch._types.SortOrder;
 import co.elastic.clients.elasticsearch._types.aggregations.Aggregation;
-import co.elastic.clients.elasticsearch._types.query_dsl.*;
+import co.elastic.clients.elasticsearch._types.query_dsl.BoolQuery;
+import co.elastic.clients.elasticsearch._types.query_dsl.DateRangeQuery;
+import co.elastic.clients.elasticsearch._types.query_dsl.GeoBoundingBoxQuery;
+import co.elastic.clients.elasticsearch._types.query_dsl.GeoShapeFieldQuery;
+import co.elastic.clients.elasticsearch._types.query_dsl.MatchAllQuery;
+import co.elastic.clients.elasticsearch._types.query_dsl.MatchPhraseQuery;
+import co.elastic.clients.elasticsearch._types.query_dsl.MatchQuery;
+import co.elastic.clients.elasticsearch._types.query_dsl.MultiMatchQuery;
+import co.elastic.clients.elasticsearch._types.query_dsl.Operator;
+import co.elastic.clients.elasticsearch._types.query_dsl.Query;
+import co.elastic.clients.elasticsearch._types.query_dsl.QueryBuilders;
+import co.elastic.clients.elasticsearch._types.query_dsl.QueryStringQuery;
+import co.elastic.clients.elasticsearch._types.query_dsl.RangeQuery;
+import co.elastic.clients.elasticsearch._types.query_dsl.ScriptScoreQuery;
+import co.elastic.clients.elasticsearch._types.query_dsl.TermQuery;
+import co.elastic.clients.elasticsearch._types.query_dsl.TermsQuery;
+import co.elastic.clients.elasticsearch._types.query_dsl.TermsQueryField;
+import co.elastic.clients.elasticsearch._types.query_dsl.TextQueryType;
+import co.elastic.clients.elasticsearch._types.query_dsl.WildcardQuery;
 import co.elastic.clients.elasticsearch.core.search.SourceConfig;
 import co.elastic.clients.json.JsonData;
 import io.vertx.codegen.annotations.DataObject;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.UUID;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import org.apache.logging.log4j.LogManager;
@@ -50,6 +92,10 @@ public class QueryModel {
   private List<String> includeFields;
   private List<String> excludeFields;
   private Map<String, String> sortFields; // Key: Field name, Value: Sort order ("asc" or "desc")
+
+  // When true (free-text query present), _score is the primary sort and sortFields break ties.
+  // When false, sortFields take precedence and _score is the final tie-breaker.
+  private boolean relevanceFirst;
 
   // Field for storing the script source (the actual script)
   private String scriptSource;
@@ -357,6 +403,14 @@ public class QueryModel {
 
   public void setSortFields(Map<String, String> sortFields) {
     this.sortFields = sortFields;
+  }
+
+  public boolean isRelevanceFirst() {
+    return relevanceFirst;
+  }
+
+  public void setRelevanceFirst(boolean relevanceFirst) {
+    this.relevanceFirst = relevanceFirst;
   }
 
   public String getScriptSource() {
@@ -702,23 +756,37 @@ public class QueryModel {
    * @return List of Elasticsearch SortOptions objects.
    */
   public List<SortOptions> toSortOptions() {
-    if (sortFields == null || sortFields.isEmpty()) {
-      return null; // Returns null if there are no sorting rules
+    List<SortOptions> sortOptions = new ArrayList<>();
+    SortOptions scoreSort = SortOptions.of(s -> s.score(sc -> sc.order(SortOrder.Desc)));
+
+    // Text search (q): relevance is the primary order, requested fields only break ties.
+    // Otherwise: requested fields (e.g. itemCreatedAt:desc) win and _score breaks ties.
+    if (relevanceFirst) {
+      sortOptions.add(scoreSort);
     }
 
-    return sortFields.entrySet().stream()
-        .map(
-            entry ->
-                SortOptions.of(
-                    s ->
-                        s.field(
-                            f ->
-                                f.field(entry.getKey())
-                                    .order(
-                                        "asc".equalsIgnoreCase(entry.getValue())
-                                            ? SortOrder.Asc
-                                            : SortOrder.Desc))))
-        .collect(Collectors.toList());
+    if (sortFields != null && !sortFields.isEmpty()) {
+      sortOptions.addAll(
+          sortFields.entrySet().stream()
+              .map(
+                  entry ->
+                      SortOptions.of(
+                          s ->
+                              s.field(
+                                  f ->
+                                      f.field(entry.getKey())
+                                          .order(
+                                              "asc".equalsIgnoreCase(entry.getValue())
+                                                  ? SortOrder.Asc
+                                                  : SortOrder.Desc))))
+              .toList());
+    }
+
+    if (!relevanceFirst) {
+      sortOptions.add(scoreSort);
+    }
+
+    return sortOptions;
   }
 
   /**

@@ -1,6 +1,8 @@
 package org.cdpg.dx.apiserver;
 
 import static org.cdpg.dx.common.config.CorsUtil.allowedOrigins;
+import static org.cdpg.dx.common.config.HttpConstants.APPLICATION_JSON;
+import static org.cdpg.dx.common.validations.util.Constants.CONTENT_TYPE;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -15,17 +17,23 @@ import io.vertx.core.http.HttpMethod;
 import io.vertx.core.http.HttpServer;
 import io.vertx.core.http.HttpServerOptions;
 import io.vertx.core.http.HttpServerResponse;
+import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 import io.vertx.core.json.jackson.DatabindCodec;
+import io.vertx.core.json.pointer.JsonPointer;
 import io.vertx.core.net.JksOptions;
 import io.vertx.ext.web.Route;
 import io.vertx.ext.web.Router;
+import io.vertx.ext.web.handler.AuthenticationHandler;
 import io.vertx.ext.web.handler.BodyHandler;
 import io.vertx.ext.web.handler.CorsHandler;
 import io.vertx.ext.web.handler.TimeoutHandler;
 import io.vertx.ext.web.openapi.RouterBuilder;
 import io.vertx.ext.web.openapi.RouterBuilderOptions;
+import io.vertx.json.schema.SchemaParser;
+import io.vertx.json.schema.SchemaRouter;
 import io.vertx.serviceproxy.HelperUtils;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -33,13 +41,17 @@ import java.util.List;
 import java.util.function.Supplier;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.cdpg.dx.auth.appid.handler.AppIdAuthHandler;
 import org.cdpg.dx.auth.authentication.client.JwksResolver;
+import org.cdpg.dx.auth.authentication.handler.CombinedAuthHandler;
 import org.cdpg.dx.auth.authentication.handler.MultiIssuerJwtAuthHandler;
 import org.cdpg.dx.auth.authentication.handler.OptionalMultiIssuerJwtAuthHandler;
 import org.cdpg.dx.common.FailureHandler;
 import org.cdpg.dx.common.HttpStatusCode;
 import org.cdpg.dx.common.URNGenerator;
+import org.cdpg.dx.common.config.HttpConstants;
 import org.cdpg.dx.common.util.BlockingExecutionUtil;
+import org.cdpg.dx.common.util.SchemaBranchResolver;
 
 /**
  * Abstract base class for OpenAPI-driven API server verticles.
@@ -73,21 +85,26 @@ import org.cdpg.dx.common.util.BlockingExecutionUtil;
  * }</pre>
  */
 public abstract class AbstractApiServerVerticle extends AbstractVerticle {
-
   private static final Logger LOGGER = LogManager.getLogger(AbstractApiServerVerticle.class);
-
-  protected static final String APPLICATION_JSON = "application/json";
-  protected static final String CONTENT_TYPE = "Content-Type";
   protected static final String ROUTE_STATIC_SPEC = "/apis/spec";
   protected static final String ROUTE_DOC = "/apis";
-
+  protected URNGenerator urnGenerator;
   private HttpServer server;
   private Router router;
-  protected URNGenerator urnGenerator;
+  protected JwksResolver jwksResolver;
 
   // =====================================================================
   // Abstract methods — subclasses MUST provide
   // =====================================================================
+  /** Utility for building standardized error responses. */
+  public static String errorResponse(HttpStatusCode code, URNGenerator urnGenerator) {
+    String urn = urnGenerator.generateUrn(code.getPath());
+    return new JsonObject()
+        .put("type", urn)
+        .put("title", code.getDescription())
+        .put("detail", code.getDescription())
+        .toString();
+  }
 
   /** Path to the OpenAPI YAML spec file (e.g., "docs/openapi.yaml"). */
   protected abstract String getOpenApiSpecPath(JsonObject config);
@@ -95,16 +112,16 @@ public abstract class AbstractApiServerVerticle extends AbstractVerticle {
   /** Default HTTP port (used if "httpPort" is not in config). */
   protected abstract int getDefaultPort();
 
+  // =====================================================================
+  // Optional overrides — sensible defaults provided
+  // =====================================================================
+
   /** Default URN prefix (e.g., "urn:dx:controlPanel:"). */
   protected abstract String getDefaultUrnPrefix();
 
   /** Create and return all API controllers for this server. */
   protected abstract List<ApiController> createControllers(
       io.vertx.core.Vertx vertx, JsonObject config, URNGenerator urnGenerator);
-
-  // =====================================================================
-  // Optional overrides — sensible defaults provided
-  // =====================================================================
 
   /** Config key for the base URL placeholder replacement. Default: "baseUrl". */
   protected String getBaseUrlConfigKey() {
@@ -124,7 +141,10 @@ public abstract class AbstractApiServerVerticle extends AbstractVerticle {
     return null;
   }
 
-  /** Body size limit for requests. Default: {@link BodyHandler#DEFAULT_BODY_LIMIT}. Use -1 for unlimited. */
+  /**
+   * Body size limit for requests. Default: {@link BodyHandler#DEFAULT_BODY_LIMIT}. Use -1 for
+   * unlimited.
+   */
   protected long getBodyLimit() {
     return BodyHandler.DEFAULT_BODY_LIMIT;
   }
@@ -143,21 +163,82 @@ public abstract class AbstractApiServerVerticle extends AbstractVerticle {
   }
 
   /**
-   * Hook for registering additional routes on the router (e.g., health, documentation). Called after
-   * all OpenAPI routes are registered.
+   * Returns true for routes that stream the request body directly (e.g. bulk ingestion). For these
+   * routes the root handler pauses the request instead of buffering it, so streaming parsers can
+   * consume the data without first loading the entire payload into memory.
+   *
+   * <p>Default: {@code false} — all routes are buffered. Override in subclasses to mark specific
+   * paths as streaming (e.g. {@code path.contains("/ingestion/")}).
+   */
+  protected boolean isStreamingRoute(String path) {
+    return false;
+  }
+
+  /**
+   * Hook for registering additional routes on the router (e.g., health, documentation). Called
+   * after all OpenAPI routes are registered.
    */
   protected void configureAdditionalRoutes(Router router, JsonObject config) {
     // Default: no-op. Subclasses override to add custom routes.
+  }
+
+  /**
+   * Returns the {@link AppIdAuthHandler} for AppId/AppSecret Basic-auth authentication, or {@code
+   * null} (default) if this service does not support AppId auth.
+   *
+   * <p>When non-null, the abstract class automatically:
+   *
+   * <ol>
+   *   <li>Wraps it with {@link MultiIssuerJwtAuthHandler} in a {@link CombinedAuthHandler}
+   *   <li>Registers that {@code CombinedAuthHandler} as both the {@code "authorization"} and {@code
+   *       "appIdAuth"} OpenAPI security schemes
+   * </ol>
+   *
+   * <p>Subclasses only need to construct and return the {@link AppIdAuthHandler} — no {@code
+   * createMainAuthHandler()} override is needed.
+   *
+   * <p>Must be ready after {@link #createControllers} returns (i.e. the gRPC client and caches
+   * created there must already be assigned to fields before this is called).
+   */
+  protected AppIdAuthHandler getAppIdAuthHandler() {
+    return null;
   }
 
   // =====================================================================
   // Lifecycle — NOT overridable
   // =====================================================================
 
+  /**
+   * Returns the primary auth handler for the {@code "authorization"} security scheme when AppId
+   * auth is NOT configured (i.e. {@link #getAppIdAuthHandler()} returns null). Default: JWT-only.
+   * Override only for services that need a fully custom auth handler without AppId support.
+   */
+  protected AuthenticationHandler createMainAuthHandler(JwksResolver jwksResolver) {
+    return new MultiIssuerJwtAuthHandler(jwksResolver);
+  }
+
+  /**
+   * Optional auth dispatcher. Subclasses return a configured {@link
+   * org.cdpg.dx.auth.authentication.handler.AuthenticationHandler} to enable the diagnostic route
+   * Default: {@code null} — the diagnostic route is not mounted.
+   */
+  protected org.cdpg.dx.auth.authentication.handler.AuthenticationHandler getAuthV2Handler() {
+    return null;
+  }
+
+  // =====================================================================
+  // Shared private methods — identical across all DX API servers
+  // =====================================================================
+
   @Override
   public void start() throws Exception {
     int port = config().getInteger("httpPort", getDefaultPort());
-    allowedOrigins = config().getJsonArray("corsAllowedOrigin").getList();
+    JsonArray corsArray = config().getJsonArray("corsAllowedOrigin");
+    if (corsArray == null) {
+      throw new IllegalArgumentException(
+          "Missing required configuration: 'corsAllowedOrigin' key must be defined in config");
+    }
+    allowedOrigins = corsArray.getList();
     String urnPrefix = config().getString("urnPrefix", getDefaultUrnPrefix());
     this.urnGenerator = new URNGenerator(urnPrefix);
 
@@ -188,6 +269,10 @@ public abstract class AbstractApiServerVerticle extends AbstractVerticle {
     // Init shared worker executor
     BlockingExecutionUtil.initialize(vertx);
 
+    // Create JWKS resolver before controllers so subclasses can use it in createControllers()
+    jwksResolver =
+        new JwksResolver(vertx, config().getJsonObject("issuers"), getJwksInternalProvider());
+
     // Create controllers
     List<ApiController> controllers = createControllers(vertx, config(), this.urnGenerator);
 
@@ -195,28 +280,34 @@ public abstract class AbstractApiServerVerticle extends AbstractVerticle {
         .onSuccess(
             routerBuilder -> {
               try {
-                // Create JWKS resolver
-                JwksResolver jwksResolver =
-                    new JwksResolver(
-                        vertx, config().getJsonObject("issuers"), getJwksInternalProvider());
 
-                // Auth handlers
-                MultiIssuerJwtAuthHandler authHandler =
-                    new MultiIssuerJwtAuthHandler(jwksResolver);
+                // Auth handlers — auto-wire CombinedAuthHandler when AppId is configured
+                MultiIssuerJwtAuthHandler jwtHandler = new MultiIssuerJwtAuthHandler(jwksResolver);
+
+                AppIdAuthHandler appIdAuthHandler = getAppIdAuthHandler();
+                org.cdpg.dx.auth.authentication.handler.AuthenticationHandler authV2 =
+                    getAuthV2Handler();
                 OptionalMultiIssuerJwtAuthHandler optionalAuthHandler =
-                    new OptionalMultiIssuerJwtAuthHandler(jwksResolver);
+                    new OptionalMultiIssuerJwtAuthHandler(authV2);
+
+                AuthenticationHandler mainAuthHandler;
+                if (authV2 != null) {
+                  mainAuthHandler = authV2;
+                  LOGGER.debug("Using AuthenticationHandler for authorization scheme");
+                } else if (appIdAuthHandler != null) {
+                  mainAuthHandler = new CombinedAuthHandler(appIdAuthHandler, jwtHandler);
+                  LOGGER.debug(
+                      "AppId auth enabled — using CombinedAuthHandler for authorization + appIdAuth");
+                } else {
+                  mainAuthHandler = createMainAuthHandler(jwksResolver);
+                }
 
                 LOGGER.debug("Adding platform handlers...");
                 long timeout = config().getLong("timeout", getDefaultTimeoutMs());
                 routerBuilder.rootHandler(TimeoutHandler.create(timeout, 408));
 
-                BodyHandler bodyHandler =
-                    BodyHandler.create().setHandleFileUploads(false);
-                long bodyLimit = getBodyLimit();
-                if (bodyLimit != BodyHandler.DEFAULT_BODY_LIMIT) {
-                  bodyHandler.setBodyLimit(bodyLimit);
-                }
-                routerBuilder.rootHandler(bodyHandler);
+                BodyHandler jsonBodyHandler = BodyHandler.create().setHandleFileUploads(false);
+                configureRootHandlerBuilder(routerBuilder, jsonBodyHandler);
 
                 LOGGER.debug("Registering controllers...");
                 RouterBuilderOptions factoryOptions =
@@ -224,8 +315,14 @@ public abstract class AbstractApiServerVerticle extends AbstractVerticle {
                 routerBuilder.setOptions(factoryOptions);
 
                 // OpenAPI security handlers
-                routerBuilder.securityHandler("authorization", authHandler);
+                routerBuilder.securityHandler("authorization", mainAuthHandler);
                 routerBuilder.securityHandler("optionalAuth", optionalAuthHandler);
+                if (authV2 != null) {
+                  // AuthenticationHandler handles both JWT and Basic (AppId) auth
+                  routerBuilder.securityHandler("appIdAuth", authV2);
+                } else if (appIdAuthHandler != null) {
+                  routerBuilder.securityHandler("appIdAuth", mainAuthHandler);
+                }
 
                 controllers.forEach(controller -> controller.register(routerBuilder));
 
@@ -235,17 +332,14 @@ public abstract class AbstractApiServerVerticle extends AbstractVerticle {
                 LOGGER.debug("Configuring CORS and error handlers...");
                 configureCorsHandler(router);
                 putCommonResponseHeaders(router);
-                configureFailureHandler(router);
+                configureFailureHandler(router, routerBuilder);
                 configureErrorHandlers(router);
 
                 // Documentation routes
                 router
                     .get(ROUTE_STATIC_SPEC)
                     .produces(APPLICATION_JSON)
-                    .handler(
-                        ctx ->
-                            ctx.response()
-                                .sendFile(tempFile.toAbsolutePath().toString()));
+                    .handler(ctx -> ctx.response().sendFile(tempFile.toAbsolutePath().toString()));
 
                 router
                     .get(ROUTE_DOC)
@@ -264,7 +358,6 @@ public abstract class AbstractApiServerVerticle extends AbstractVerticle {
 
                 // Allow subclasses to add custom routes
                 configureAdditionalRoutes(router, config());
-
                 LOGGER.debug("Starting HTTP server...");
                 HttpServerOptions serverOptions = new HttpServerOptions();
                 configureSsl(serverOptions);
@@ -278,9 +371,7 @@ public abstract class AbstractApiServerVerticle extends AbstractVerticle {
                           if (http.succeeded()) {
                             printDeployedEndpoints(router);
                             LOGGER.info(
-                                "{} deployed on port: {}",
-                                this.getClass().getSimpleName(),
-                                port);
+                                "{} deployed on port: {}", this.getClass().getSimpleName(), port);
                           } else {
                             LOGGER.error(
                                 "HTTP server failed to start: {}",
@@ -301,16 +392,20 @@ public abstract class AbstractApiServerVerticle extends AbstractVerticle {
                     failure));
   }
 
+  protected RouterBuilder configureRootHandlerBuilder(
+      RouterBuilder routerBuilder, BodyHandler jsonBodyHandler) {
+
+    routerBuilder.rootHandler(jsonBodyHandler::handle);
+
+    return routerBuilder;
+  }
+
   @Override
   public void stop() {
     if (server != null) {
       server.close();
     }
   }
-
-  // =====================================================================
-  // Shared private methods — identical across all DX API servers
-  // =====================================================================
 
   private void configureJackson() {
     ObjectMapper mapper = DatabindCodec.mapper();
@@ -379,7 +474,10 @@ public abstract class AbstractApiServerVerticle extends AbstractVerticle {
             }
             return;
           }
-          response.setStatusCode(401).putHeader(CONTENT_TYPE, APPLICATION_JSON).end("not implemented");
+          response
+              .setStatusCode(401)
+              .putHeader(CONTENT_TYPE, APPLICATION_JSON)
+              .end("not implemented");
         });
   }
 
@@ -399,13 +497,38 @@ public abstract class AbstractApiServerVerticle extends AbstractVerticle {
     }
   }
 
-  private void configureFailureHandler(Router router) {
-    String ngsildPattern = getNgsildPathPattern();
-    if (ngsildPattern != null) {
-      router.route().failureHandler(new FailureHandler(this.urnGenerator, ngsildPattern));
-    } else {
-      router.route().failureHandler(new FailureHandler(this.urnGenerator));
+  private void configureFailureHandler(Router router, RouterBuilder routerBuilder) {
+    router
+        .route()
+        .failureHandler(
+            new FailureHandler(
+                this.urnGenerator, getNgsildPathPattern(), branchResolver(routerBuilder)));
+  }
+
+  /**
+   * Lets the failure handler re-validate the branches of a failed {@code oneOf}, which is the only
+   * way to report which field was wrong instead of just "no schema matches".
+   *
+   * <p>The branches of a bundled spec are refs to internal {@code urn:vertxschemas:} ids that only
+   * this router's own {@code SchemaRouter} can resolve, so the capability has to come from here.
+   * Resolution failures are swallowed: a missing branch costs detail in an error message, which is
+   * never worth failing a request over.
+   */
+  private SchemaBranchResolver branchResolver(RouterBuilder routerBuilder) {
+    SchemaRouter schemaRouter = routerBuilder.getSchemaRouter();
+    SchemaParser schemaParser = routerBuilder.getSchemaParser();
+    if (schemaRouter == null || schemaParser == null) {
+      return null;
     }
+    return (ref, scope) -> {
+      try {
+        return schemaRouter.resolveCachedSchema(
+            JsonPointer.fromURI(URI.create(ref)), scope, schemaParser);
+      } catch (RuntimeException unresolvable) {
+        LOGGER.debug("Could not resolve schema branch {} for error detail", ref, unresolvable);
+        return null;
+      }
+    };
   }
 
   private void printDeployedEndpoints(Router router) {
@@ -414,15 +537,5 @@ public abstract class AbstractApiServerVerticle extends AbstractVerticle {
         LOGGER.info("Deployed endpoint [{}] {}", route.methods(), route.getPath());
       }
     }
-  }
-
-  /** Utility for building standardized error responses. */
-  public static String errorResponse(HttpStatusCode code, URNGenerator urnGenerator) {
-    String urn = urnGenerator.generateUrn(code.getPath());
-    return new JsonObject()
-        .put("type", urn)
-        .put("title", code.getDescription())
-        .put("detail", code.getDescription())
-        .toString();
   }
 }

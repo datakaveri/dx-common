@@ -2,29 +2,29 @@ package org.cdpg.dx.common;
 
 import io.vertx.core.Handler;
 import io.vertx.ext.web.RoutingContext;
-import io.vertx.ext.web.validation.BodyProcessorException;
-import io.vertx.ext.web.validation.ParameterProcessorException;
-import io.vertx.ext.web.validation.RequestPredicateException;
-import io.vertx.json.schema.ValidationException;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.cdpg.dx.common.config.HttpConstants;
 import org.cdpg.dx.common.exception.DxInternalServerErrorException;
 import org.cdpg.dx.common.exception.DxTimeOutException;
 import org.cdpg.dx.common.response.DxErrorResponse;
 import org.cdpg.dx.common.response.DxErrorResponseNGSILD;
 import org.cdpg.dx.common.util.ExceptionHttpStatusMapper;
+import org.cdpg.dx.common.util.RequestValidationErrorFormatter;
+import org.cdpg.dx.common.util.SchemaBranchResolver;
 import org.cdpg.dx.common.util.ThrowableUtils;
 
 public class FailureHandler implements Handler<RoutingContext> {
 
   private static final Logger LOGGER = LogManager.getLogger(FailureHandler.class);
-  private static final String CONTENT_TYPE = "content-type";
-  private static final String APPLICATION_JSON = "application/json";
   private static final String HEADER_ALLOW_ORIGIN = "Access-Control-Allow-Origin";
   private static final String HEADER_HOST = "Host";
+  private static final String HEADER_ALLOW_METHODS = "Access-Control-Allow-Methods";
+  private static final String HEADER_ALLOW_HEADERS = "Access-Control-Allow-Headers";
 
   private final URNGenerator urnGenerator;
   private final String ngsildPathPattern;
+  private final SchemaBranchResolver branchResolver;
 
   /**
    * Create a FailureHandler with configurable NGSI-LD path pattern.
@@ -32,20 +32,42 @@ public class FailureHandler implements Handler<RoutingContext> {
    * @param urnGenerator the URN generator for error responses
    * @param ngsildPathPattern regex pattern for NGSI-LD paths (e.g. "/ngsi-ld/v1.*" or
    *     ".*iudx/v2/subscriptions.*"). Null means no NGSI-LD path matching.
+   * @param branchResolver resolves the branches of a failed {@code oneOf} so validation errors can
+   *     name the offending field instead of only saying that nothing matched. Null disables that,
+   *     which is the right default anywhere the schema router is not available.
    */
-  public FailureHandler(URNGenerator urnGenerator, String ngsildPathPattern) {
+  public FailureHandler(
+      URNGenerator urnGenerator, String ngsildPathPattern, SchemaBranchResolver branchResolver) {
     this.urnGenerator = urnGenerator;
     this.ngsildPathPattern = ngsildPathPattern;
+    this.branchResolver = branchResolver;
+  }
+
+  public FailureHandler(URNGenerator urnGenerator, String ngsildPathPattern) {
+    this(urnGenerator, ngsildPathPattern, null);
   }
 
   public FailureHandler(URNGenerator urnGenerator) {
-    this(urnGenerator, null);
+    this(urnGenerator, null, null);
+  }
+
+  /**
+   * Request validation failures are caller mistakes, not server faults: log one readable line at
+   * warn and keep the (very long) vertx-validation stack trace behind debug.
+   */
+  private void logValidationFailure(RoutingContext context, Throwable failure) {
+    LOGGER.warn(
+        "Request validation failed [{} {}]: {}",
+        context.request().method(),
+        context.request().path(),
+        RequestValidationErrorFormatter.logDetail(failure, branchResolver));
+    LOGGER.debug("Request validation failure stack trace", failure);
   }
 
   @Override
   public void handle(RoutingContext context) {
     String path = context.request().path();
-    LOGGER.error("path : {} ", path);
+    LOGGER.debug("path : {} ", path);
 
     if (ngsildPathPattern != null && path.matches(ngsildPathPattern)) {
       ngsildErrorResponse(context);
@@ -66,25 +88,22 @@ public class FailureHandler implements Handler<RoutingContext> {
         failure = new DxInternalServerErrorException("Unknown server error");
       }
     }
-    LOGGER.info("FailureHandler: {}", failure.getClass());
+    LOGGER.debug("FailureHandler: {}", failure.getClass());
 
-    if (failure instanceof ValidationException
-        || failure instanceof BodyProcessorException
-        || failure instanceof RequestPredicateException
-        || failure instanceof ParameterProcessorException) {
-      LOGGER.error("Validation error: {}", failure.getMessage(), failure);
+    if (RequestValidationErrorFormatter.isValidationFailure(failure)) {
+      logValidationFailure(context, failure);
       context
           .response()
-          .putHeader(CONTENT_TYPE, APPLICATION_JSON)
+          .putHeader(HttpConstants.HEADER_CONTENT_TYPE, HttpConstants.APPLICATION_JSON)
           .putHeader(HEADER_ALLOW_ORIGIN, "*")
-          .putHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-          .putHeader("Access-Control-Allow-Headers", "Authorization, Content-Type")
+          .putHeader(HEADER_ALLOW_METHODS, HttpConstants.CORS_METHODS)
+          .putHeader(HEADER_ALLOW_HEADERS, HttpConstants.CORS_HEADERS)
           .setStatusCode(400)
           .end(
               ResponseUtil.generateResponse(
                       HttpStatusCode.BAD_REQUEST,
                       urnGenerator.generateUrn(HttpStatusCode.BAD_REQUEST.getPath()),
-                      "Missing or malformed request")
+                      RequestValidationErrorFormatter.clientMessage(failure, branchResolver))
                   .toString());
       return;
     }
@@ -111,10 +130,10 @@ public class FailureHandler implements Handler<RoutingContext> {
 
       context
           .response()
-          .putHeader(CONTENT_TYPE, APPLICATION_JSON)
+          .putHeader(HttpConstants.HEADER_CONTENT_TYPE, HttpConstants.APPLICATION_JSON)
           .putHeader(HEADER_ALLOW_ORIGIN, "*")
-          .putHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-          .putHeader("Access-Control-Allow-Headers", "Authorization, Content-Type")
+          .putHeader(HEADER_ALLOW_METHODS, HttpConstants.CORS_METHODS)
+          .putHeader(HEADER_ALLOW_HEADERS, HttpConstants.CORS_HEADERS)
           .setStatusCode(status)
           .end(errorResponse.toJson().encode());
     }
@@ -133,24 +152,22 @@ public class FailureHandler implements Handler<RoutingContext> {
         failure = new DxInternalServerErrorException("Unknown server error");
       }
     }
-    LOGGER.info("FailureHandlerNGSILD: {}", failure.getClass());
+    LOGGER.debug("FailureHandlerNGSILD: {}", failure.getClass());
 
-    if (failure instanceof ValidationException
-        || failure instanceof BodyProcessorException
-        || failure instanceof RequestPredicateException
-        || failure instanceof ParameterProcessorException) {
+    if (RequestValidationErrorFormatter.isValidationFailure(failure)) {
+      logValidationFailure(context, failure);
       context
           .response()
-          .putHeader(CONTENT_TYPE, APPLICATION_JSON)
+          .putHeader(HttpConstants.HEADER_CONTENT_TYPE, HttpConstants.APPLICATION_JSON)
           .putHeader(HEADER_ALLOW_ORIGIN, "*")
-          .putHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-          .putHeader("Access-Control-Allow-Headers", "Authorization, Content-Type")
+          .putHeader(HEADER_ALLOW_METHODS, HttpConstants.CORS_METHODS)
+          .putHeader(HEADER_ALLOW_HEADERS, HttpConstants.CORS_HEADERS)
           .setStatusCode(400)
           .end(
               ResponseUtilNGSILD.generateResponse(
                       HttpStatusCode.BAD_REQUEST,
                       urnGenerator.generateUrn(HttpStatusCode.BAD_REQUEST.getPath()),
-                      failure.getMessage(),
+                      RequestValidationErrorFormatter.clientMessage(failure, branchResolver),
                       instance)
                   .toString());
       return;
@@ -178,10 +195,10 @@ public class FailureHandler implements Handler<RoutingContext> {
 
       context
           .response()
-          .putHeader(CONTENT_TYPE, APPLICATION_JSON)
+          .putHeader(HttpConstants.HEADER_CONTENT_TYPE, HttpConstants.APPLICATION_JSON)
           .putHeader(HEADER_ALLOW_ORIGIN, "*")
-          .putHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-          .putHeader("Access-Control-Allow-Headers", "Authorization, Content-Type")
+          .putHeader(HEADER_ALLOW_METHODS, HttpConstants.CORS_METHODS)
+          .putHeader(HEADER_ALLOW_HEADERS, HttpConstants.CORS_HEADERS)
           .setStatusCode(status)
           .end(errorResponse.toJson().encode());
     }

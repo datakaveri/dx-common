@@ -1,30 +1,18 @@
 package org.cdpg.dx.auth.authentication.handler;
 
-import io.vertx.core.json.JsonObject;
 import io.vertx.ext.web.RoutingContext;
 import io.vertx.ext.web.handler.AuthenticationHandler;
-import java.util.Base64;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.cdpg.dx.auth.authentication.client.JwksResolver;
 import org.cdpg.dx.auth.authentication.util.BearerTokenExtractor;
-import org.cdpg.dx.common.exception.DxUnauthorizedException;
 
 public class OptionalMultiIssuerJwtAuthHandler implements AuthenticationHandler {
-  private static final Logger LOGGER =
-      LogManager.getLogger(OptionalMultiIssuerJwtAuthHandler.class);
 
-  private final JwksResolver jwksResolver;
+  private static final Logger LOGGER = LogManager.getLogger(OptionalMultiIssuerJwtAuthHandler.class);
+  private final AuthenticationHandler authenticationHandler;
 
-  public OptionalMultiIssuerJwtAuthHandler(JwksResolver resolver) {
-    this.jwksResolver = resolver;
-  }
-
-  private static String extractIssuer(String token) {
-    String[] parts = token.split("\\.");
-    if (parts.length < 2) throw new IllegalArgumentException("Malformed JWT");
-    String payload = new String(Base64.getUrlDecoder().decode(parts[1]));
-    return new JsonObject(payload).getString("iss");
+  public OptionalMultiIssuerJwtAuthHandler(AuthenticationHandler authenticationHandler) {
+    this.authenticationHandler = authenticationHandler;
   }
 
   @Override
@@ -36,27 +24,6 @@ public class OptionalMultiIssuerJwtAuthHandler implements AuthenticationHandler 
       return;
     }
 
-    String issuer;
-    try {
-      issuer = extractIssuer(token);
-    } catch (Exception e) {
-      LOGGER.error("Failed to extract issuer: {}", e.getMessage());
-      ctx.fail(new DxUnauthorizedException("Invalid token format"));
-      return;
-    }
-
-    jwksResolver
-        .resolve(issuer)
-        .compose(jwtAuth -> jwtAuth.authenticate(new JsonObject().put("token", token)))
-        .onSuccess(
-            user -> {
-              ctx.setUser(user);
-              ctx.next();
-            })
-        .onFailure(
-            err -> {
-              LOGGER.error("Authentication failed for issuer {}: {}", issuer, err.getMessage());
-              ctx.fail(new DxUnauthorizedException("Unauthorized: %s".formatted(err.getMessage())));
-            });
+    authenticationHandler.handle(ctx);
   }
 }
